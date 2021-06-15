@@ -1,0 +1,798 @@
+variables:
+    PROJECT_NAME: $CI_PROJECT_NAME
+    LINE: "--===========================================================--"
+
+stages:
+    - start 
+    - sonar
+    - build
+    - kubernetes
+    - health_check
+    - unity_test
+    - coverage
+    - pruebas_contrato
+    - performance
+    - urbancode
+    - rollback
+
+start:
+    stage: start
+    before_script:
+        - echo "export ROLLBACK=False" > rollback
+        - datetime=$(date '+%d-%m-%Y %H:%M:%S')
+    script:      
+        - Ejecuta="True"
+        - |
+          if [[ -z $commit ]]; then
+            commit=${CI_COMMIT_SHA:0:8}
+          else
+            if ! git cat-file -e $commit 2> /dev/null; then 
+              echo "No existe el commit ingresado"; 
+              Ejecuta="False"
+            fi
+          fi
+        - |
+          cat << EOF > datos_ejecucion
+          Datos de ejecución:
+            DateTime   =  $datetime
+            Email      =  $GITLAB_USER_EMAIL
+            ID User    =  $GITLAB_USER_ID
+            Login      =  $GITLAB_USER_LOGIN
+            Nombre     =  $GITLAB_USER_NAME
+            Pipeline   =  $CI_PIPELINE_ID
+            URL        =  $CI_PROJECT_URL
+            CLUSTER    =  $CLUSTER
+            Commit     =  $commit
+            Ejecuta    =  $Ejecuta
+          EOF
+        - cat datos_ejecucion
+        - |
+          if [[ ${Ejecuta} == "False" ]];then
+            exit 1
+          fi
+    artifacts:
+      when: always 
+      paths:
+        - datos_ejecucion
+        - rollback
+    when: manual
+    allow_failure: false
+
+pruebas sonar:
+    stage: sonar
+    variables:
+        SONARQUBE: "172.16.97.65:31568"
+    before_script:
+        - |
+          if [[ ! -z $commit ]]; then
+            git checkout $commit
+          fi
+        - PROJECT_KEY=$(grep sonar.projectKey sonar-project.properties | cut -d '=' -f 2)
+        - PROJECT_NAME=$(grep sonar.projectName sonar-project.properties | cut -d '=' -f 2)
+        - set +e # Disable exit on error
+        - RESULT=$(curl -u $USER_SONAR:$PASS_SONAR -X GET http://$SONARQUBE/api/projects/search?projects=${PROJECT_KEY})
+        - echo $RESULT | jq
+        - EXIST=$(echo $RESULT | jq  ".paging.total")
+        - |
+          if [ $(expr $EXIST) == 0 ]; then
+            RESULT=$(curl -u $USER_SONAR:$PASS_SONAR --data "key=${PROJECT_KEY}&name=${PROJECT_NAME}&project=${PROJECT_NAME}" -X POST "http://$SONARQUBE/api/projects/create")
+            echo $RESULT | jq
+          else
+            echo "El proyecto ${PROJECT_NAME} EXISTE";
+          fi
+        - set -e # Enable exit on error
+    script:
+        - /opt/java/sonar-scanner-4.2.0.1873-linux/bin/sonar-scanner -X
+        - RESULTADO=$(curl -u $USER_SONAR:$PASS_SONAR -X GET "http://$SONARQUBE/api/qualitygates/project_status?projectKey=$PROJECT_KEY")
+        - STATUS=$(echo $RESULTADO | cut -d'"' -f 6)
+        - echo "ESTADO = $STATUS"
+        - |
+          GREEN=$'\e[1;32m'
+          RED=$'\e[1;31m'
+          NC=$'\e[0m'
+          if [ ! -z $STATUS ]; then
+            if [ "$STATUS" == "OK" ]; then
+                printf "\n\n========\n${NC}Quality Gate Aprobada para ${GREEN}${PROJECT_NAME}${NC}\n\n"
+            else    
+                echo "$RESULTADO" | jq
+                printf "\n========\n\n${NC}Quality Gate NO Aprobada para ${RED}${PROJECT_NAME}${NC}\n"
+                printf "\n--------\n\n${NC} Favor revise informe de SonarQube en la siguiente URL: ${GREEN}http://$SONARQUBE/dashboard?id=$PROJECT_KEY${NC}\n\n========\n"
+                exit 1
+            fi
+          else
+            echo "$RESULTADO" | jq
+            printf "\n========\n\n${RED} Error en la obtencion de Quality Gate para ${PROJECT_NAME}{$NC}\n\n========\n"
+            exit 1
+          fi
+    allow_failure: true
+
+build image:
+    stage: build
+    before_script:
+        - |
+          if [[ ! -z $commit ]]; then
+            git checkout $commit
+            CI_COMMIT_SHA=$(git rev-parse --short=8 $commit)
+          fi
+        - cp -a /opt/axis2c . 
+        - |
+          if [[ "${PROJECT_NAME}" == "cobrepagoserviciosbff" || "$PROJECT_NAME" == "cajavecinabff" || "$PROJECT_NAME" == "bffcontenedora" || "$PROJECT_NAME" == "pagosdigitalesbff" || "$PROJECT_NAME" == "cambioclaveatm" || "$PROJECT_NAME" == "pagoservicios" || "$PROJECT_NAME" == "datospersonanatural" || "${PROJECT_NAME}" == "plasticos" || "${PROJECT_NAME}" == "datoscuentacomercioms" || "${PROJECT_NAME}" == "pagocuentasconocidasms" || "${PROJECT_NAME}" == "fraudebilletera" || "${PROJECT_NAME}" == "muc" ]]; then
+                DOCKERFILE=Dockerfile_skeleton_v1
+          elif [[ "${PROJECT_NAME}" == "autenticacion" || "${PROJECT_NAME}" == "autenticaciontest" || "${PROJECT_NAME}" == "validaotp" ]]; then
+                DOCKERFILE=Dockerfile_skeleton_autenticacion_v1
+          elif [[ "$PROJECT_NAME" == "analisisnivelfraude" || "$PROJECT_NAME" == "billeterabd" ||  "$PROJECT_NAME" == "bloqueodesbloqueo" ||  "$PROJECT_NAME" == "restriccionesfraudems" || "$PROJECT_NAME" == "comunidadbe" || "$PROJECT_NAME" == "pagosqr" ]]; then
+                DOCKERFILE=Dockerfile_node_runtime_mysql_pd_v1
+                curl -k -o entry.sh --header  "PRIVATE-TOKEN:${TOKEN_GITLAB_EE}"  https://gitlab.banco.bestado.cl/api/v4/projects/132/repository/files/node%2Fentry%2Esh/raw?ref=master
+          elif [[ "$PROJECT_NAME" == "filenet" ]]; then
+                DOCKERFILE=Dockerfile_node_runtime_qpdf_pd_v1
+          else
+                DOCKERFILE=Dockerfile_node_runtime_pd_v1
+          fi
+        - curl -k -o ${DOCKERFILE} --header "PRIVATE-TOKEN:${TOKEN_GITLAB_EE}" https://gitlab.banco.bestado.cl/api/v4/projects/132/repository/files/node%2F${DOCKERFILE}/raw?ref=master
+        - echo ${DOCKERFILE}
+    script:
+        #- set +e # Disable exit on error
+        - echo "CONSTRUYENDO IMAGEN"
+        - echo "Se usará Dockerfile:\ ${DOCKERFILE}"
+        - cat ${DOCKERFILE}
+        - |
+          if [[ "${CLUSTER}" == "persona" ]]; then
+            DOCKER_IMAGE="desacluster.icp:8500/${NAMESPACE}/${IMAGENAME}_${CI_PROJECT_NAME}_${VERSION}:${CI_PIPELINE_ID}"            
+          elif [[ "${CLUSTER}" == "empresa" ]]; then
+            DOCKER_IMAGE="empresasdesa.icp:8500/${NAMESPACE}/${IMAGENAME}_${CI_PROJECT_NAME}_${VERSION}:${CI_PIPELINE_ID}"            
+          else
+            DOCKER_IMAGE="saleforcedesa.icp:8500/${NAMESPACE}/${IMAGENAME}_${CI_PROJECT_NAME}_${VERSION}:${CI_PIPELINE_ID}"            
+          fi       
+        - echo "CONSTRUYENDO IMAGEN:\ ${DOCKER_IMAGE}_${CI_COMMIT_SHA:0:8} DOCKER FILE:\ ${DOCKERFILE}"
+        - docker build -t ${DOCKER_IMAGE}_${CI_COMMIT_SHA:0:8} -f ${DOCKERFILE} .
+        - echo "SUBIENDO IMAGEN A REGISTRY ICP"
+        - docker push ${DOCKER_IMAGE}_${CI_COMMIT_SHA:0:8}
+    after_script:
+        - |
+          GREEN=$'\e[1;32m'
+          RED=$'\e[1;31m'
+          NC=$'\e[0m'
+
+          AUX=0
+          ENTRY=0
+          version_greater_equal(){
+          OFICIALVERSION=$1
+          LIBRARYNAME=$2
+          NEWVERSION=$(cat package.json | jq ".dependencies[\"$LIBRARYNAME\"]"  | sed "s/\^\|\~\|\"//g")
+          if [[ "$ENTRY" == 0 ]] && [[ $NEWVERSION != "null" ]];then
+            printf "\n\n%-20s%-23s%-18s%-15s\n" "Libreria" "Version del proyecto" "Version oficial" "Estado"
+            printf "%-20s%-23s%-18s%-8s\n" "========" "====================" "===============" "======"
+            ENTRY=1
+          fi
+          if [ "${OFICIALVERSION}" == "${NEWVERSION}" ];then
+            printf "%-28s%-13s%-7s%-14s${GREEN}OK${NC}\n" "$LIBRARYNAME" "${NEWVERSION}" "=" "${OFICIALVERSION}"
+          else
+            LAST=$(printf '%s\n%s\n' "$OFICIALVERSION" "$NEWVERSION" | sort -V | head -1)
+            if [ "${LAST}" == "${NEWVERSION}" ];then
+              printf "%-28s%-13s%-7s%-14s${RED}NOK${NC}\n" "$LIBRARYNAME" "${NEWVERSION}" "<" "${OFICIALVERSION}"
+              AUX=1
+            fi
+          fi
+          }
+
+          version_greater_equal 2.0.0 "logger-bech"
+          version_greater_equal 2.1.2 "redis-bech"
+          version_greater_equal 3.0.2 "soap-client-bech"
+          version_greater_equal 0.9.3 "jwt-bech"
+          if [ "${AUX}" == 1 ];then
+            printf "\n\n${RED} El proyecto utiliza dependencias deprecadas. Revisar! ${NC}\n\n\n"
+          fi
+
+
+kubernetes:
+    stage: kubernetes
+    before_script:
+        - |
+          if [[ "${CLUSTER}" == "persona" ]]; then
+            curl -k -o charts.tar --header "PRIVATE-TOKEN:${TOKEN_GITLAB_EE}" https://gitlab.banco.bestado.cl/api/v4/projects/220/repository/archive.tar?ref=master            
+          else
+            curl -k -o charts.tar --header "PRIVATE-TOKEN:${TOKEN_GITLAB_EE}" https://gitlab.banco.bestado.cl/api/v4/projects/812/repository/archive.tar?ref=master            
+          fi
+
+        - tar -xvf charts.tar
+        - toMove=$(ls | grep charts-master-)
+        - mv $toMove charts-master
+        - |
+          if [[ ! -z $commit ]]; then
+            CI_COMMIT_SHA=$(git rev-parse --short=8 $commit)
+          fi
+        - set +e # Disable exit on error
+        - container=$(docker ps | grep "cluster${CLUSTER}"  | awk '{print $1}' | head -1)
+        - set -e # Enable exit on error
+        - |
+          if [[ -z $container ]]; then
+            container=$(docker run -it -d "desacluster.icp:8500/operaciones/cluster${CLUSTER}:1.0.1")
+            echo "Nuevo Container ID => ${container:0:12}"
+          fi
+    script:
+        - set +e # Disable exit on error
+        - ACTUAL_NAMESPACE=$(docker exec $container /bin/bash -c "helm list --tls | grep ${PROJECT_NAME}-${VERSION}" | awk '{print $10}')
+        - |
+          if [[ "${ACTUAL_NAMESPACE}" != ""  ]] && [[ "${ACTUAL_NAMESPACE}" != "$NAMESPACE" ]]; then
+            # Se realiza la purga del componente para ser desplegado en el nuevo namespace
+            echo "${ACTUAL_NAMESPACE} != $NAMESPACE"
+            docker exec $container /bin/bash -c "helm delete ${PROJECT_NAME}-${VERSION} --purge --tls"
+          fi
+        - sed -i 's/tag:\ cambiame/tag:\ '\"${CI_PIPELINE_ID}_${CI_COMMIT_SHA:0:8}\"'/g' charts-master/${PROJECT_NAME}/values.yaml
+        - |
+          if [[ "${CLUSTER}" == "empresa" ]]; then
+            sed -i 's/desacluster/empresasdesa/g' charts-master/${PROJECT_NAME}/values.yaml
+          elif [[ "${CLUSTER}" == "saleforce" ]]; then
+            sed -i 's/desacluster/saleforcedesa/g' charts-master/${PROJECT_NAME}/values.yaml
+          fi   
+        # Seccion de docker connect
+        - cloud_script=$(echo "cloud${CLUSTER^}.sh")
+        - docker cp /home/gitlab-runner/${cloud_script} $container:/usr/src
+        - docker exec $container /bin/bash -c "sh ${cloud_script}"
+        - docker exec $container /bin/bash -c "if [ -d "${PROJECT_NAME}" ]; then rm -rf ${PROJECT_NAME}; fi"
+        - docker cp charts-master/${PROJECT_NAME} $container:/usr/src
+        - set +e # Disable exit on error
+        - helmExecution=""
+        - |
+          echo "helm status ${PROJECT_NAME}-${VERSION} --tls |grep STATUS | head -n 1 | awk '{print $2}'"
+          STATUS=$(docker exec $container /bin/bash -c "helm status ${PROJECT_NAME}-${VERSION} --tls |grep STATUS | head -n 1")
+          STATUS=$(echo $STATUS | awk '{print $2}')
+        - set -e
+        - |
+          if [[ $STATUS == "DEPLOYED" ]]; then
+            echo "Se actualiza el chart"
+            echo "helm upgrade ${PROJECT_NAME}-${VERSION} ${PROJECT_NAME} -f ${PROJECT_NAME}/values.yaml --namespace ${NAMESPACE} --tls --no-hooks"
+            helmExecution=$(docker exec $container /bin/bash -c "helm upgrade ${PROJECT_NAME}-${VERSION} ${PROJECT_NAME} -f ${PROJECT_NAME}/values.yaml --namespace ${NAMESPACE} --tls --no-hooks")
+          elif [[ $STATUS == "FAILED" ]]; then
+            echo "helm delete ${PROJECT_NAME}-${VERSION} --purge --tls"
+            helmExecution=$(docker exec $container /bin/bash -c "helm delete ${PROJECT_NAME}-${VERSION} --purge --tls")
+            echo "Instalando chart"
+            helmExecution=$(docker exec $container /bin/bash -c "helm install ${PROJECT_NAME} -f ${PROJECT_NAME}/values.yaml --namespace ${NAMESPACE} --name=${PROJECT_NAME}-${VERSION} --tls")
+          else
+            echo "Se instala chart"
+            echo "helm install ${PROJECT_NAME} -f ${PROJECT_NAME}/values.yaml --namespace ${NAMESPACE} --name=${PROJECT_NAME}-${VERSION} --tls"
+            helmExecution=$(docker exec $container /bin/bash -c "helm install ${PROJECT_NAME} -f ${PROJECT_NAME}/values.yaml --namespace ${NAMESPACE} --name=${PROJECT_NAME}-${VERSION} --tls")
+          fi       
+        - echo "Helm Execution:\ ${CI_PIPELINE_ID}_${CI_COMMIT_SHA:0:8}" >> helm_${CI_PIPELINE_ID}.txt
+        - echo "$helmExecution" >> helm_${CI_PIPELINE_ID}.txt
+        - cat helm_${CI_PIPELINE_ID}.txt
+    artifacts:
+      when: always 
+      paths:
+        - helm_${CI_PIPELINE_ID}.txt
+        
+
+health check:
+    stage: health_check
+    variables:
+        MAXRETRY: 50
+        SECONDSTOWAIT: 3
+    before_script:
+        - echo "export ROLLBACK=True" >> rollback-health
+        - set +e # Disable exit on error
+        - container=$(docker ps | grep "cluster${CLUSTER}"  | awk '{print $1}' | head -1)
+        - set -e # Enable exit on error
+        - |
+          if [[ -z $container ]]; then
+            container=$(docker run -it -d "desacluster.icp:8500/operaciones/cluster${CLUSTER}:1.0.1")
+            echo "Nuevo Container ID => ${container:0:12}"
+          fi
+    script:
+        - set +e # Disable exit on error
+        - /home/gitlab-runner/configICP.sh
+        - cat helm_${CI_PIPELINE_ID}.txt
+        # Seccion de docker connect
+        - cloud_script=$(echo "cloud${CLUSTER^}.sh")
+        - docker cp /home/gitlab-runner/${cloud_script} $container:/usr/src
+        - docker exec $container /bin/bash -c "sh ${cloud_script}"
+        - arraypods=$(cat helm_${CI_PIPELINE_ID}.txt | grep "${PROJECT_NAME}-${VERSION}-deployment-[[:alnum:]]*" | grep -v Running | grep -v Terminating | grep -v CrashLoopBackOff | grep -v ImagePullBackOff | grep -v Error | awk '{print $1}')
+        - echo $arraypods
+        - finalPod=""
+        - |
+          retry=0
+          while [[ $retry -lt ${MAXRETRY} ]] && [[ ${arraypods} != "" ]]; do
+            for pod in $arraypods; do              
+              validate=0
+              arraystatus=$(docker exec $container /bin/bash -c "kubectl get pod $pod -n ${NAMESPACE} -o=json | jq '.status.conditions' | jq '.[] | .status'" )
+              if [[ $arraystatus == "" ]];then
+                echo "No se pudo encontrar el pod: $pod";
+                break;
+              fi
+              for statuspod in $arraystatus; do
+                if [[ ${statuspod} == \"False\" ]]; then
+                  echo "Pending...";
+                  #kubectl get pod $pod -o=json | jq '.status.conditions'
+                  validate=1
+                  break
+                fi
+              done
+              if [[ ${validate} -eq 1 ]]; then
+                break;
+              fi
+              finalPod=$pod
+            done
+            if [[ $finalPod == "" ]]; then
+              retry=$((retry + 1))
+              echo "Reintento número $retry ..."
+              sleep "${SECONDSTOWAIT}s"
+            else 
+              retry=${MAXRETRY}
+            fi
+          done
+        - set -e # Disable exit on error
+        - echo "export FINAL_POD=$finalPod;" >> pod
+        - |
+          if [[ $finalPod == "" ]]; then
+            echo "El servicio no logró inicializarse automáticamente en $((${MAXRETRY}*${SECONDSTOWAIT})) segundos."
+            exit 1
+          fi
+    artifacts:
+      when: always 
+      paths:
+        - pod
+        - rollback-health
+        
+
+pruebas unitarias:
+    stage: unity_test
+    variables:      
+      UNITYTEST_K8_DIFF_COMMIT: "\n\n  $LINE\n\tHay otra version desplegada en Kubernetes.\n\tNo se puede volver a gatillar el stage 'unity_test'\n\tFavor Vuelva a generar un nuevo pipeline\n  $LINE\n\n"
+    before_script:
+        - source pod
+
+        - set +e
+        - container=$(docker ps | grep "cluster${CLUSTER}"  | awk '{print $1}' | head -1)
+        - set -e # Enable exit on error
+        - |
+          if [[ -z $container ]]; then
+            container=$(docker run -it -d "desacluster.icp:8500/operaciones/cluster${CLUSTER}:1.0.1")
+            echo "Nuevo Container ID => ${container:0:12}"
+          fi
+        # Seccion de docker connect
+        - cloud_script=$(echo "cloud${CLUSTER^}.sh")
+        - docker cp /home/gitlab-runner/${cloud_script} $container:/usr/src
+        - docker exec $container /bin/bash -c "sh ${cloud_script}"
+        # BEGIN: Se verifica la version que esta activa vs el commit a desplegar
+        - |
+          if [[ "${CLUSTER}" == "persona" ]]; then
+            image=$(docker exec $container /bin/bash -c "kubectl get deployment ${PROJECT_NAME}-${VERSION}-deployment -o wide -n ${NAMESPACE}" | awk '{print $8}' | tail -1 )
+          else
+            image=$(docker exec $container /bin/bash -c "kubectl get deployment ${PROJECT_NAME}-${VERSION}-deployment -o wide -n ${NAMESPACE}" | awk '{print $7}' | tail -1 )
+          fi
+        - splited=($(echo $image | tr ":" "\n"))
+        - splited=($(echo "${splited[-1]}" | tr "_" "\n"))
+        - |
+            if [[ ! -z $commit ]]; then
+              CI_COMMIT_SHA=$(git rev-parse --short=8 $commit)
+            fi
+        - |
+          if [ "${splited[-1]}" != "${CI_COMMIT_SHA:0:8}" ] || [ "${splited[-2]}" != ${CI_PIPELINE_ID} ];then
+            echo "${UNITYTEST_K8_DIFF_COMMIT}"
+            exit 1
+          fi
+        # END
+    script:        
+        - echo $FINAL_POD
+        - set +e
+        - return=$(docker exec $container /bin/bash -c "kubectl exec -n ${NAMESPACE} $FINAL_POD -c ${PROJECT_NAME} -- /bin/bash -c 'make unit-test 2>&1'")
+        - echo "${return}"
+        - set -e
+        - PASSING=0
+        - FAILING=0
+        - JEST_VERSION=0
+        - NYC_VERSION=$(cat package.json | jq ".devDependencies.nyc" | sed "s/\^\|\"//g" | cut -d "." -f1)
+        - JEST_VERSION=$(cat package.json | jq ".devDependencies.jest" | sed "s/\^\|\"//g" | cut -d "." -f1)
+        - echo "NYC_VERSION -> ${NYC_VERSION}"
+        - echo "JEST_VERSION -> ${JEST_VERSION}"
+        - |
+          if [[ "${NYC_VERSION}" == 15 || "${PROJECT_NAME}" == "movimientos" || "${PROJECT_NAME}" == "ofertascupotcr-ms" || "${PROJECT_NAME}" == "aumentocupotcr-bff" || "${PROJECT_NAME}" == "aumentocupotcr-ms" ]]; then
+            PASSING=$(echo ${return} | awk '{print match($0,"passed")}')
+          else
+            PASSING=$(echo ${return} | awk '{print match($0,"passing")}')
+          fi
+        - |
+          if [[ ${PASSING} -ne 0 ]]; then
+            if [[ "${PROJECT_NAME}" == "movimientos" || "${PROJECT_NAME}" == "ofertascupotcr-ms" || "${PROJECT_NAME}" == "aumentocupotcr-bff" || "${PROJECT_NAME}" == "aumentocupotcr-ms" ]]; then
+              PASSING=$(echo "${return}" | grep passed | tail -1 | awk '{print $2}')
+            elif [[ "${NYC_VERSION}" == 15 ]]; then
+              PASSING=$(echo "${return}" | grep passed | tail -1 | awk '{print $1}')
+            else
+              PASSING=$(echo "${return}" | grep passing | tail -1 | awk -F passing '{print $1}')
+            fi
+            echo ${PASSING}
+            #PASSING=$(expr $PASSING)
+          fi
+        - |
+          if [[ "${NYC_VERSION}" == 15 ||  "${PROJECT_NAME}" == "movimientos" || "${PROJECT_NAME}" == "ofertascupotcr-ms" || "${PROJECT_NAME}" == "aumentocupotcr-bff" || "${PROJECT_NAME}" == "aumentocupotcr-ms" ]]; then
+            FAILING=$(echo ${return} | awk '{print match($0,"failed")}')
+          else
+            FAILING=$(echo ${return} | awk '{print match($0,"failing")}')
+          fi
+        - |
+          if [[ ${FAILING} -ne 0 ]]; then
+            if [[ "${PROJECT_NAME}" == "movimientos" ]]; then
+              FAILING=$(echo "${return}" | grep failed | tail -1 | awk '{print $2}')
+            elif [[ "${NYC_VERSION}" == 15 ]]; then
+              PASSING=$(echo "${return}" | grep failed | tail -1 | awk '{print $1}')
+            else
+              FAILING=$(echo "${return}" | grep failing | tail -1 | awk -F failing '{print $1}')
+            fi
+            #FAILING=$(expr ${FAILING})
+          fi
+        - |
+          if [[ "${JEST_VERSION}" -ne 0  ]]; then
+            PASSING=0
+            TOTAL=0
+            FAILING=0
+            PASSING=$(echo "${return}" | grep 'Tests:' | awk '{print $0}' | awk '{print $(NF - 3)}')
+            TOTAL=$(echo "${return}" | grep 'Tests:' | awk '{print $0}' | awk '{print $(NF - 1)}')
+            if [[ "${PASSING}" != "${TOTAL}" ]]; then
+              FAILING=$(echo "${return}" | grep 'Tests:' | grep 'failed,' | awk '{print $0}' | awk '{print $(NF - 5)}')
+            fi
+          fi
+        - echo "Failing -> ${FAILING}"
+        - echo "Passing -> ${PASSING}"
+        - echo "TOTAL -> ${TOTAL}"
+        #- echo "Fin Pruebas Unitarias $((${PASSING}/${TOTAL}))"
+        - |
+          if [[ ${PASSING} -eq 0 ]]; then
+            echo "No existen ejecuciones exitosas"
+            exit 1
+          fi
+          if [[ ${FAILING} -gt 0 ]]; then
+           echo "Fallas [${FAILING}]"
+           exit 1
+          fi
+        - echo "Se copia carpeta de coverage a imagen docker"
+        - docker exec $container /bin/bash -c "kubectl exec -n ${NAMESPACE} $FINAL_POD -c ${PROJECT_NAME} -- /bin/bash -c 'cat coverage/lcov.info | lcov-summary '" > lcov-summary-filtered
+        #- coverage=$(docker exec $container /bin/bash -c "kubectl cp -n ${NAMESPACE} $FINAL_POD:/usr/src/app/coverage ${PROJECT_NAME}/coverage") 
+        #- docker cp $container:/usr/src/${PROJECT_NAME}/coverage ./coverage
+    artifacts:
+      when: always 
+      paths:
+        - lcov-summary-filtered
+
+pruebas de contrato:
+    stage: pruebas_contrato
+    before_script:
+        - source pod
+        - set +e
+        - container=$(docker ps | grep "cluster${CLUSTER}"  | awk '{print $1}' | head -1)
+        - set -e # Enable exit on error
+        - |
+          if [[ -z $container ]]; then
+            container=$(docker run -it -d "desacluster.icp:8500/operaciones/cluster${CLUSTER}:1.0.1")
+            echo "Nuevo Container ID => ${container:0:12}"
+          fi
+        # Seccion de docker connect
+        - cloud_script=$(echo "cloud${CLUSTER^}.sh")
+        - docker cp /home/gitlab-runner/${cloud_script} $container:/usr/src
+        - docker exec $container /bin/bash -c "sh ${cloud_script}"
+        # BEGIN: Se verifica la version que esta activa vs el commit a desplegar
+        - |
+          if [[ "${CLUSTER}" == "persona" ]]; then
+            image=$(docker exec $container /bin/bash -c "kubectl get deployment ${PROJECT_NAME}-${VERSION}-deployment -o wide -n ${NAMESPACE}" | awk '{print $8}' | tail -1 )
+          else
+            image=$(docker exec $container /bin/bash -c "kubectl get deployment ${PROJECT_NAME}-${VERSION}-deployment -o wide -n ${NAMESPACE}" | awk '{print $7}' | tail -1 )
+          fi
+        - splited=($(echo $image | tr ":" "\n"))
+        - splited=($(echo "${splited[-1]}" | tr "_" "\n"))
+        - |
+            if [[ ! -z $commit ]]; then
+              CI_COMMIT_SHA=$(git rev-parse --short=8 $commit)
+            fi
+        - |
+          if [ "${splited[-1]}" != "${CI_COMMIT_SHA:0:8}" ] || [ "${splited[-2]}" != ${CI_PIPELINE_ID} ];then
+            echo "${UNITYTEST_K8_DIFF_COMMIT}"
+            exit 1
+          fi
+        # END
+    script:
+        - echo $FINAL_POD
+        - return=$(docker exec $container /bin/bash -c "kubectl exec -n ${NAMESPACE} $FINAL_POD -c ${PROJECT_NAME} -- /bin/bash -c 'make contract'")
+        - echo "${return}"
+        - PASSING=$(echo ${return} | awk '{print match($0,"passing")}')
+        - |
+          if [[ ${PASSING} -ne 0 ]]; then
+              PASSING=$(echo "${return}" | grep "passing" | tail -1 | awk -F "passing" '{print $1}')
+              #PASSING=$(expr ${PASSING})
+          fi
+        - FAILING=$(echo ${return} | awk '{print match($0,"failing")}')
+        - |
+          if [[ ${FAILING} -ne 0 ]]; then
+              FAILING=$(echo "${return}" | grep "failing" | tail -1 | awk -F "failing" '{print $1}' | awk -F "passing" '{print $2}' | awk -F ")" '{print $2}')
+              #FAILING=$(expr ${FAILING})
+          fi
+        - echo "Failing -> ${FAILING}"
+        - echo "Passing -> ${PASSING}"
+        - TOTAL=$((${FAILING} + ${PASSING}))
+        - echo "Fin Pruebas de contrato $((${PASSING}/${TOTAL}))"  
+        - |
+          if [[ $PASSING -eq 0 ]]; then
+            echo "No existen ejecuciones exitosas"
+            exit 1
+          fi
+          if [[ ${FAILING} -gt 0 ]]; then
+           echo "Fallas [${FAILING}]"
+           exit 1
+          fi
+    allow_failure: true
+
+coverage:
+    stage: coverage
+    script:
+        - COVERAGE=$(cat lcov-summary-filtered | grep 'Total Coverage' | awk '{print $3}' | awk -F '.' '{print $1}')
+        - |
+          if [[ $COVERAGE -lt $THRESHOLD ]];then
+            echo "COVERAGE [${COVERAGE} < ${THRESHOLD}]"
+            exit 1
+          fi
+        - echo "COVERAGE [${COVERAGE}]"
+
+validacion JMX:
+    stage: performance
+    variables:
+        JMX_K8_DIFF_COMMIT: "\n\n  $LINE\n\tHay otra version desplegada en Kubernetes.\n\tNo se puede volver a gatillar el stage 'performance'\n\tFavor Vuelva a generar un nuevo pipeline\n  $LINE\n\n"
+        concurrenciaObjetivo: 1
+        incrementoEnSegundos: 1
+        numeroDeIncrementos: 0
+        limiteDeIteraciones: 1
+        mantenerTasaObjetivoPorNSegundos: 1
+        external_port_osvt: 443
+        external_port_ocvt: 443
+        external_protocol: https
+        port_ocvt: 443 # Antes 9443
+        port_osvt: 443 # Antes 9443
+        port: 443 # Antes 9443
+        protocol: https
+        archivoValoresParametricos: csv_desarrollo.txt
+        TYPE: microservicios
+    before_script:
+        - set +e
+        - container=$(docker ps | grep "cluster${CLUSTER}"  | awk '{print $1}' | head -1)
+        - set -e # Enable exit on error
+        - |
+          if [[ -z $container ]]; then
+            container=$(docker run -it -d "desacluster.icp:8500/operaciones/cluster${CLUSTER}:1.0.1")
+            echo "Nuevo Container ID => ${container:0:12}"
+          fi
+        # Seccion de docker connect
+        - cloud_script=$(echo "cloud${CLUSTER^}.sh")
+        - docker cp /home/gitlab-runner/${cloud_script} $container:/usr/src
+        - docker exec $container /bin/bash -c "sh ${cloud_script}"
+        # BEGIN: Se verifica la version que esta activa vs el commit a desplegar
+        - |
+          if [[ "${CLUSTER}" == "persona" ]]; then
+            image=$(docker exec $container /bin/bash -c "kubectl get deployment ${PROJECT_NAME}-${VERSION}-deployment -o wide -n ${NAMESPACE}" | awk '{print $8}' | tail -1 )
+          else
+            image=$(docker exec $container /bin/bash -c "kubectl get deployment ${PROJECT_NAME}-${VERSION}-deployment -o wide -n ${NAMESPACE}" | awk '{print $7}' | tail -1 )
+          fi
+        - splited=($(echo $image | tr ":" "\n"))
+        - splited=($(echo "${splited[-1]}" | tr "_" "\n"))
+        - |
+            if [[ ! -z $commit ]]; then
+              CI_COMMIT_SHA=$(git rev-parse --short=8 $commit)
+            fi
+        - |
+          if [ "${splited[-1]}" != "${CI_COMMIT_SHA:0:8}" ] || [ "${splited[-2]}" != ${CI_PIPELINE_ID} ];then
+            echo "${JMX_K8_DIFF_COMMIT}"
+            exit 1
+          fi
+        # END
+        - set +e
+        - mkdir -p pruebasPerformance/salida
+        - archivoJMX=$(ls test/pruebasPerformance/ | grep jmx | grep -vi peaks)
+        - archivoReporteSalida=ResultadoPruebaDePerformance_${PROJECT_NAME}_${CI_PIPELINE_ID}.csv
+        - |
+          if [[ -z ${archivoJMX} ]]; then  
+            echo "Archivo jmx no existe"
+            exit 1
+          fi
+        - archivo="test/pruebasPerformance/$archivoJMX"
+        - existeCSV=$(cat ${archivo} | grep '<CSVDataSet' | wc -l)
+        - confCSV=$(echo $(cat ${archivo}) | awk -F '<CSVDataSet' '{print $2}' | awk -F '</CSVDataSet' '{print $1}')
+        - archivoCSV=$(echo $confCSV | sed 's/> </>\n</g' | grep filename | grep -Ei "[\$]{__[a-z]+\(+[a-z._-]+[,]{0,10}\)}" | wc -l)
+        - lecturaCSV=$(echo $confCSV | sed 's/> </>\n</g' | grep variableNames | grep '></stringProp>' | wc -l)        
+        - concurrenciaObjetivoT=$(cat ${archivo} | grep  -Ei "[\$]{__[a-z]+\(concurrenciaObjetivo\)}" | wc -l)
+        - incrementoEnSegundosT=$(cat ${archivo} | grep  -Ei "[\$]{__[a-z]+\(incrementoEnSegundos\)}" | wc -l)
+        - numeroDeIncrementosT=$(cat ${archivo} | grep  -Ei "[\$]{__[a-z]+\(numeroDeIncrementos\)}" | wc -l)
+        - mantenerTasaObjetivoPorNSegundosT=$(cat ${archivo} | grep  -Ei "[\$]{__[a-z]+\(mantenerTasaObjetivoPorNSegundos\)}" | wc -l)
+        - limiteDeIteracionesT=$(cat ${archivo} | grep  -Ei "[\$]{__[a-z]+\(limiteDeIteraciones\)}" | wc -l)
+        - |
+          if [[ $concurrenciaObjetivoT -eq 0 ]]; then
+            echo "VARIABLE DE CONFIGURACION concurrenciaObjetivo NO DEFINIDA EN LA PRUEBA"
+            exit 1
+          fi
+
+          if [[ $incrementoEnSegundosT -eq 0 ]]; then
+            echo "VARIABLE DE CONFIGURACION incrementoEnSegundos NO DEFINIDA EN LA PRUEBA"
+            exit 1
+          fi
+          if [[ $limiteDeIteracionesT -eq 0 ]]; then
+            echo "VARIABLE DE CONFIGURACION limiteDeIteraciones NO DEFINIDA EN LA PRUEBA"
+          fi
+        - domainC=$(cat ${archivo} | grep 'HTTPSampler.domain' | grep -v -Ei "[\$]{__[a-zA-Z\._-]+\(+[a-zA-Z\._-]+\)+}" | wc -l)
+        - portC=$(cat ${archivo} | grep 'HTTPSampler.port' | grep -v -Ei "[\$]{__[a-zA-Z\._-]+\(+[a-zA-Z\._-]+\)+}" | wc -l)
+        - protocolC=$(cat ${archivo} | grep 'HTTPSampler.protocol' | grep -v -Ei "[\$]{__[a-zA-Z\._-]+\(+[a-zA-Z\._-]+\)+}" | wc -l)
+        - pathC=$(cat ${archivo} | grep 'HTTPSampler.path' | grep -v 'apps' | grep -v 'servicios' | grep -v 'bff' | grep -v 'apis' | wc -l)
+        - llamada=$(cat ${archivo} | grep -i "servicios/${PROJECT_NAME}/${TYPE}" | wc -l)
+    script:
+        - |
+          cat << EOF > jmeter.sh
+          /opt/java/jmeter -n -t $archivo \
+            -JconcurrenciaObjetivo=$concurrenciaObjetivo \
+            -JincrementoEnSegundos=$incrementoEnSegundos \
+            -JnumeroDeIncrementos=$numeroDeIncrementos \
+            -JmantenerTasaObjetivoPorNSegundos=$mantenerTasaObjetivoPorNSegundos \
+            -JlimiteDeIteraciones=$limiteDeIteraciones \
+            -Jhostname=${HOSTNAME} \
+            -Jexternal_hostname=${HOSTNAME} \
+            -Jexternal_port_osvt=$external_port_osvt \
+            -Jexternal_port_ocvt=$external_port_ocvt \
+            -Jport_osvt=$port_osvt \
+            -Jport_ocvt=$port_ocvt \
+            -Jport=$port \
+            -Jprotocol=$protocol \
+            -Jexternal_protocol=$external_protocol \
+            -Jexternal_hostname_pd=${HOSTNAME} \
+            -Jcsvfile=test/pruebasPerformance/$archivoValoresParametricos \
+            -Jjmeter.save.saveservice.output_format=csv \
+            -l pruebasPerformance/salida/$archivoReporteSalida \
+            -e -o pruebasPerformance/salida/${PROJECT_NAME}_${CI_PIPELINE_ID}
+          EOF
+        - cat jmeter.sh
+        - result=$(sh jmeter.sh)
+        - echo $result
+        - RESULTADOS=$(echo "${result}" | grep "summary" | grep "Err:" | tail -1)
+        - ERRORES=$(echo ${RESULTADOS} | awk '{print $15}')
+        - LLAMADAS=$(echo ${RESULTADOS} | awk '{print $3}')
+        - EJECUCION=$(echo "${result}" | grep "summary" | grep "Err:" | wc -l)
+        - echo "Ejecucion= ${EJECUCION}; Llamadas= ${LLAMADAS}; Errores= ${ERRORES}"
+        # Se hace una validación si es la rama Desarrollo-CI | http://172.17.200.7:8080/job/pruebas_performance_rancher_efimero_ms_pd/configure
+        - |
+          if [[ ${EJECUCION} -eq 0 ]]; then
+            echo "La prueba no se ejecutó correctamente"
+            exit 1
+          fi
+          if [[ ${LLAMADAS} -eq 0 ]]; then
+            echo "No se ejecutaron llamadas"
+            exit 1
+          fi
+          if [[ ${ERRORES} -gt 0 ]]; then
+            echo "Fallas [${ERRORES}]"
+            exit 1
+          fi
+    artifacts:
+        when: always 
+        paths:
+        - pruebasPerformance/salida
+    allow_failure: true
+   
+urbancode:
+    stage: urbancode
+    variables:
+        folder: "test/pruebasPerformance"
+    before_script:
+        - |
+          if [[ "${CLUSTER}" == "persona" ]]; then
+            curl -k -o Chart.yaml --header  "PRIVATE-TOKEN:${TOKEN_GITLAB_EE}"  https://gitlab.banco.bestado.cl/api/v4/projects/220/repository/files/${PROJECT_NAME}%2FChart%2Eyaml/raw?ref=master
+          else
+            curl -k -o Chart.yaml --header  "PRIVATE-TOKEN:${TOKEN_GITLAB_EE}"  https://gitlab.banco.bestado.cl/api/v4/projects/812/repository/files/${PROJECT_NAME}%2FChart%2Eyaml/raw?ref=master
+          fi
+        - |
+          if [[ ! -z $commit ]]; then
+            CI_COMMIT_SHA=$(git rev-parse --short=8 $commit)
+          fi
+        - mkdir input
+        - archivoJMX=$(ls ${folder} | grep jmx | grep -vi peaks)
+        - datetime=$(date '+%d-%m-%Y %H:%M:%S')
+        - dockerTag=${CI_PIPELINE_ID}_${CI_COMMIT_SHA:0:8}
+        - component=${PROJECT_NAME}
+        - chartsVersion=$(cat Chart.yaml | grep version | awk '{print $2}')
+        - set +e
+        - retorno=$(java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 getComponent -component ${component})
+    script:
+        - |
+          cat << EOF > input/input.properties
+            gitTag=${CI_COMMIT_SHA:0:8}
+            dockerTag=$dockerTag
+            msName=$component
+            chartsVersion=${chartsVersion}
+            nameSpace=${NAMESPACE}
+            imageName=${IMAGENAME}_${PROJECT_NAME}_${VERSION}
+            pathJMX=${folder}
+            archivoJMX=$archivoJMX
+            version=${VERSION}
+            idProyecto=${CI_PROJECT_ID}
+            nomCluster=${CLUSTER}
+          EOF
+        - |
+          cat << EOF > newComponent.json
+            {
+              "name":"${component}",
+              "description":"${TIPO}",
+              "templateName":"CD_ICP",
+              "templateVersion":"",
+              "template/MyProperty":"MyValue",
+              "componentType":"STANDARD",
+              "sourceConfigPlugin":"",
+              "importAutomatically":"false",
+              "useVfs":"true",
+              "defaultVersionType":"FULL",
+              "importAgentType":"inherit",
+              "inheritSystemCleanup":"true",
+              "runVersionCreationProcess":"false",
+              "properties":{},
+              "teamMappings":[]
+            }
+          EOF   
+        - |
+          if [[ "No component for" =~ ^${retorno} ]]; then            
+            java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 createComponent newComponent.json
+            if [[ "${CLUSTER}" == "persona" ]]; then
+              java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 addComponentToApplication -application CD-ICP -component ${component}
+            elif [[ "${CLUSTER}" == "empresa" ]]; then
+              java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 addComponentToApplication -application CD-ICP-EMPRESA -component ${component}
+            else
+              java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 addComponentToApplication -application CD-ICP-SALEFORCE -component ${component}
+            fi            
+            echo "La componente ${component} se ha generado con exito"
+          fi
+        - cat input/input.properties
+        - java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 createVersion -component ${component} -name ${dockerTag}
+        - java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 addVersionFiles -component ${component} -version ${dockerTag} -base input
+        - java -jar /opt/urbancode-cli/udclient.jar -username ${URBANUSER} -password ${URBANPASS} -weburl https://167.28.86.224:8443 addVersionStatus -component ${component} -version ${dockerTag} -status QA          
+        - echo "DateTime   =  $datetime"
+    when: manual
+    allow_failure: false
+
+
+rollback:
+    stage: rollback 
+    before_script:
+        - source rollback
+        - set +e
+        - container=$(docker ps | grep "cluster${CLUSTER}"  | awk '{print $1}' | head -1)
+        - set -e # Enable exit on error
+        - |
+          if [[ -z $container ]]; then
+            container=$(docker run -it -d "desacluster.icp:8500/operaciones/cluster${CLUSTER}:1.0.1")
+            echo "Nuevo Container ID => ${container:0:12}"
+          fi
+        # Seccion de docker connect
+        - cloud_script=$(echo "cloud${CLUSTER^}.sh")
+        - docker cp /home/gitlab-runner/${cloud_script} $container:/usr/src
+        - docker exec $container /bin/bash -c "sh ${cloud_script}"
+
+        - cat rollback
+        - |
+          if [[ -f rollback-health ]];then
+            echo "El archivo rollback-health existe"
+            cat rollback-health
+            source rollback-health
+          fi
+        - |
+          if [[ -f pod ]];then
+            echo "El archivo pod existe"
+            cat pod
+            source pod
+          fi        
+    script:
+        - echo $ROLLBACK
+        - echo $FINAL_POD
+        - |
+          if [[ $ROLLBACK == "False" ]]; then
+            rollback="No se gatilla RollBack"
+          else
+            set -e
+            rollback=$(docker exec $container /bin/bash -c "helm rollback ${PROJECT_NAME}-${VERSION} 0 --tls")
+            set +e
+          fi
+        - echo $rollback
+        - echo "$rollback" >> helmrollback.log
+    when: on_failure
+    artifacts:
+        when: always 
+        paths:
+        - helmrollback.log
+# Fin CI    

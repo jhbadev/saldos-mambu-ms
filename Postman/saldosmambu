@@ -1,0 +1,86 @@
+{
+	"info": {
+		"_postman_id": "d11237fc-03dc-49be-b654-f4c274515eba",
+		"name": "SaldosMambu",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Health",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "http://localhost:3240/api/v2/healthcheck",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3240",
+					"path": [
+						"api",
+						"v2",
+						"healthcheck"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Amount",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "pChannel",
+						"value": "APP_IN",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"headerRQ\": {\n        \"msgId\": \"12345\",\n        \"timestamp\": \"timestamp\"\n    },\n    \"securityRQ\": {\n        \"userId\": \"userId\",\n        \"hostId\": \"hostId\",\n        \"channelId\": \"APP_IN\",\n        \"profile\": \"profile\"\n    },\n    \"messageRQ\": {\n        \"rut\": \"3451012\",\n        \"numCta\": \"00100000000008\"\n    }\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "http://localhost:3240/api/v2/amount",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3240",
+					"path": [
+						"api",
+						"v2",
+						"amount"
+					]
+				}
+			},
+			"response": []
+		}
+	]
+}
