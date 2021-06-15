@@ -1,2 +1,1 @@
-Unidad Plataforma Digital
-saldos-pts-ms
+Version Inicial Saldos Mambu en base a planilla DT
